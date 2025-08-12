@@ -128,63 +128,93 @@ class TallyProcessor:
             -- Identify DR-CR pairs by looking at consecutive transactions with same amount
             SELECT 
                 nt.*,
-                -- For each transaction, find the next transaction (to match DR with following CR)
-                LEAD(nt.credit_amount) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as next_credit,
-                LEAD(nt.date) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as next_cr_date,
-                LEAD(nt.ledger_txn_no) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as next_txn_no
+                -- For each transaction, find the previous transaction (to match CR with preceding DR)
+                LAG(nt.debit_amount) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as prev_debit,
+                LAG(nt.ledger_txn_no) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as prev_txn_no,
+                LAG(nt.date) OVER (PARTITION BY nt.account_number ORDER BY nt.original_order) as prev_date
             FROM numbered_transactions nt
         ),
         classified_pairs AS (
-            -- Classify transactions into pair types after LEAD functions are calculated
+            -- Classify transactions into pair types after LAG functions are calculated
             SELECT 
                 tp.*,
                 -- Identify if this is part of a DR-CR pair
                 CASE 
-                    WHEN tp.debit_amount > 0 AND tp.ledger_txn_no IS NOT NULL AND tp.ledger_txn_no != '' 
-                         AND tp.next_credit = tp.debit_amount THEN 'DR_with_paired_CR'
-                    WHEN tp.debit_amount > 0 AND tp.ledger_txn_no IS NOT NULL AND tp.ledger_txn_no != '' THEN 'DR_unpaired'
-                    WHEN tp.credit_amount > 0 THEN 'CR_transaction'
+                    WHEN tp.debit_amount > 0 AND tp.ledger_txn_no IS NOT NULL AND tp.ledger_txn_no != '' THEN 'DR_with_txn'
+                    WHEN tp.credit_amount > 0 AND tp.prev_debit = tp.credit_amount AND tp.prev_txn_no IS NOT NULL AND tp.prev_txn_no != '' THEN 'CR_paired'
                     ELSE 'other'
                 END as pair_type
             FROM transaction_pairs tp
         ),
-        final_transactions AS (
+        consolidated_pairs AS (
+            -- Group DR-CR pairs together, keeping only one entry per pair (DR transaction represents the pair)
             SELECT 
                 cp.account_number,
                 a.customer_name,
                 a.customer_amount,
+                -- For DR transactions or unpaired transactions, use their own data
+                CAST(cp.date AS DATE) as transaction_date,
                 cp.opening_balance,
+                cp.debit_amount,
+                cp.credit_amount,
                 cp.closing_balance,
                 -- Get transaction number without prefix
                 CASE 
-                    WHEN cp.pair_type IN ('DR_with_paired_CR', 'DR_unpaired') THEN cp.ledger_txn_no
+                    WHEN cp.pair_type = 'DR_with_txn' THEN cp.ledger_txn_no
+                    WHEN cp.ledger_txn_no IS NOT NULL AND cp.ledger_txn_no != '' THEN cp.ledger_txn_no
                     ELSE ''
                 END as clean_txn_no,
-                -- For DR transactions, get both debit and credit amounts
+                -- For paired transactions, use the transaction date from transactions.xlsx if available
                 CASE 
-                    WHEN cp.pair_type = 'DR_with_paired_CR' THEN cp.debit_amount
-                    WHEN cp.pair_type = 'DR_unpaired' THEN cp.debit_amount
-                    ELSE 0.0
-                END as debit_amount,
-                CASE 
-                    WHEN cp.pair_type = 'DR_with_paired_CR' THEN cp.next_credit
-                    WHEN cp.pair_type = 'DR_unpaired' THEN 0.0
-                    ELSE 0.0
-                END as credit_amount,
-                -- Use transaction date from transactions.xlsx if available, otherwise ledger date
-                CASE 
-                    WHEN cp.pair_type IN ('DR_with_paired_CR', 'DR_unpaired') AND tm.txn_date IS NOT NULL THEN CAST(tm.txn_date AS DATE)
+                    WHEN cp.pair_type = 'DR_with_txn' AND tm.txn_date IS NOT NULL THEN CAST(tm.txn_date AS DATE)
                     ELSE CAST(cp.date AS DATE)
                 END as final_date,
-                cp.original_order
+                cp.original_order,
+                cp.pair_type
             FROM classified_pairs cp
             LEFT JOIN accounts a ON cp.account_number = a.account_number
             -- Match transaction mappings for getting dates
             LEFT JOIN transaction_mappings tm ON cp.account_number = tm.account_number 
                 AND cp.ledger_txn_no = tm.transaction_number
-            -- Only include DR transactions (skip CR transactions as they're represented by their paired DR)
-            WHERE cp.pair_type IN ('DR_with_paired_CR', 'DR_unpaired')
+            -- Only include DR transactions and unpaired transactions, skip paired CR transactions
+            WHERE cp.pair_type != 'CR_paired'
         ),
+        -- Now we need to add the credit amounts to the corresponding DR transactions
+        paired_transactions AS (
+            SELECT 
+                cp.*,
+                -- For DR transactions, find the following CR transaction amount and date
+                LEAD(tp2.credit_amount) OVER (PARTITION BY cp.account_number ORDER BY cp.original_order) as next_credit,
+                LEAD(tp2.date) OVER (PARTITION BY cp.account_number ORDER BY cp.original_order) as next_cr_date,
+                LEAD(tm2.txn_date) OVER (PARTITION BY cp.account_number ORDER BY cp.original_order) as next_cr_txn_date
+            FROM consolidated_pairs cp
+            LEFT JOIN classified_pairs tp2 ON cp.account_number = tp2.account_number 
+                AND tp2.original_order = cp.original_order + 1
+                AND tp2.pair_type = 'CR_paired'
+            LEFT JOIN transaction_mappings tm2 ON tp2.account_number = tm2.account_number 
+                AND tp2.prev_txn_no = tm2.transaction_number
+        ),
+        final_transactions AS (
+            SELECT 
+                pt.account_number,
+                pt.customer_name,
+                pt.customer_amount,
+                pt.opening_balance,
+                pt.closing_balance,
+                pt.clean_txn_no,
+                -- For DR transactions with paired CR, we have both amounts in the pair
+                pt.debit_amount,
+                COALESCE(pt.next_credit, pt.credit_amount, 0.0) as credit_amount,
+                -- Prioritize credit date from transactions.xlsx, then credit date from ledger, then DR date
+                CASE 
+                    WHEN pt.pair_type = 'DR_with_txn' AND pt.next_cr_txn_date IS NOT NULL THEN CAST(pt.next_cr_txn_date AS DATE)
+                    WHEN pt.pair_type = 'DR_with_txn' AND pt.next_cr_date IS NOT NULL THEN CAST(pt.next_cr_date AS DATE)
+                    ELSE pt.final_date
+                END as final_date,
+                pt.original_order
+            FROM paired_transactions pt
+        ),
+        -- NEW: Instead of aggregating, return one row per transaction
         transaction_results AS (
             SELECT 
                 ft.account_number,
@@ -277,7 +307,7 @@ class TallyProcessor:
     def consolidate_results(self, chunk_files: List[Path]) -> pl.DataFrame:
         """
         Consolidate results from all chunks efficiently.
-        Now maintains one row per transaction instead of aggregating by account.
+        Now properly handles balance-aware tally calculation with opening balance.
         """
         logger.info("Consolidating results from all chunks...")
 
@@ -292,22 +322,30 @@ class TallyProcessor:
         """
         self.conn.execute(query)
 
-        # Simply select all data without aggregation since each row is already a transaction
+        # Final aggregation across all chunks - maintain order and pairing
+        # Use balance-aware tally calculation consistent with chunk processing
         final_query = """
         SELECT 
             account_number,
             customer_name,
-            transaction_nos,
-            dates,
-            total_debit,
-            total_credit,
-            opening_balance,
-            debit_count,
-            credit_count,
-            tally_value,
-            customer_amount
+            -- Concatenate all transaction_nos strings, preserving order
+            STRING_AGG(transaction_nos, chr(10)) as transaction_nos,
+            -- Concatenate all dates strings, preserving order  
+            STRING_AGG(dates, chr(10)) as dates,
+            ROUND(SUM(total_debit), 2) as total_debit,
+            ROUND(SUM(total_credit), 2) as total_credit,
+            CAST(SUM(debit_count) AS INTEGER) as debit_count,
+            CAST(SUM(credit_count) AS INTEGER) as credit_count,
+            -- Use balance-aware tally: Opening Balance + Credits - Debits
+            ROUND(MIN(account_opening_balance) + SUM(total_credit) - SUM(total_debit), 2) as tally_value,
+            -- Include balance information for optional output
+            ROUND(MIN(account_opening_balance), 2) as opening_balance,
+            ROUND(MAX(account_closing_balance), 2) as closing_balance,
+            -- Include customer amount for reference
+            MAX(customer_amount) as customer_amount
         FROM all_chunks
-        ORDER BY account_number, dates
+        GROUP BY account_number, customer_name
+        ORDER BY account_number
         """
 
         final_df = self.conn.execute(final_query).pl()

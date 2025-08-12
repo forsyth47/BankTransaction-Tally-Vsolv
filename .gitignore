@@ -2,3 +2,5 @@
 # Ignore old data directory
 # Ignore output dir's files
 /output/*
+/.idea
+/.venv
