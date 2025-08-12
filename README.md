@@ -15,3 +15,7 @@ I've tried to make the script as modular as possible, so you can change mostly a
 ```bash
 python tally.py
 ```
+
+---
+thank you :D\
+made by joshua on 2025-08-12 :)
